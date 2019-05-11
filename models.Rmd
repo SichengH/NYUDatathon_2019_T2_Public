@@ -1,0 +1,121 @@
+---
+title: "Analysis"
+output: html_notebook
+---
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(purrr)
+library(broom)
+library(pROC)
+library(data.table)
+library(plotROC)
+df <- read.csv("outpout_data_firsticu.csv") %>% as.data.table
+setDT(df)
+```
+
+Define pesi
+
+```{r}
+df[, pesi:=(age>80) + cancer + lung_disease + (HeartRate_Mean >= 110) + (SysBP_Mean < 100) + (SpO2_Mean < 90)]
+df[, auc(roc(DODin30~pesi))]
+```
+
+```{r}
+pesi_vars <- c('age', 'cancer', 'lung_disease', 'HeartRate_Mean', 'SysBP_Mean', 'SpO2_Mean')
+# map(pesi_vars, ~sum(is.na(df[[.x]])))
+df <- df[df[, complete.cases(.SD), .SDcols=c(pesi_vars, "DODin30")],]
+```
+
+
+Marginals
+
+```{r}
+lr1 <- glm(DODin30~factor(pesi)+Afib, data = df, family = 'binomial')
+summary(lr1)
+
+lr2 <- glm(DODin30~age+cancer+lung_disease+(HeartRate_Mean >= 110)+(SysBP_Mean<100)+(SpO2_Mean),
+           data = df, family = 'binomial')
+
+lr3 <- glm(DODin30~age+cancer+lung_disease+(HeartRate_Mean >= 110)+(SysBP_Mean<100)+(SpO2_Mean) + Afib,
+           data = df, family = 'binomial')
+
+lr4 <- glm(DODin30~age+cancer + Afib,
+           data = df, family = 'binomial')
+
+# anova(lr1, lr2, lr3, test="Chisq")
+anova(lr2, lr3, test="Chisq")
+anova(lr3, lr4, test="Chisq")
+
+df[, auc(roc(DODin30 ~ predict(lr1)))]
+df[, auc(roc(DODin30 ~ predict(lr2)))]
+df[, auc(roc(DODin30 ~ predict(lr3)))]
+
+d1 <- drop1(lr3)
+var_df <- data.frame(variable=rownames(d1), AIC = d1$AIC)
+var_df$AIC_diff <- (var_df$AIC - var_df[1, ]$AIC)
+var_df <- arrange(var_df, AIC_diff)
+library(magrittr)
+
+var_df %>%
+  filter(variable!='<none>') %>%
+  ggplot(aes(variable, AIC_diff, fill=AIC_diff>0)) + geom_col() + 
+  theme_minimal() + ggtitle("variable importance") + theme(legend.position = 'none')
+
+attr(d1, 'heading')
+
+df[, table(Afib, DODin30)]
+df[, prop.table(table(Afib, DODin30), margin=1)]
+df[, summary(table(Afib, DODin30))]
+```
+
+```{r}
+df[, lp1:=predict(lr1)]
+df[, pesi_refitted:=predict(lr2)]
+df[, pesi_with_af:=predict(lr3)]
+dfm <- melt.data.table(df[, .SD, .SDcols=c("DODin30", "pesi", "pesi_refitted", "pesi_with_af")], id.vars="DODin30", variable.name = 'model', value.name = 'prediction')
+
+
+
+dfm %>% 
+  filter(model=='pesi') %>%
+  ggplot(aes(m=prediction, d=DODin30, col=model)) + geom_roc(labels=F) +
+  theme_minimal() + theme(legend.position='bottom') +
+  ggtitle("AUC - pesi")
+  
+dfm %>% 
+  filter(model %in% c('pesi', 'pesi_refitted')) %>%
+  ggplot(aes(m=prediction, d=DODin30, col=model)) + geom_roc(labels=F) +
+  theme_minimal() + theme(legend.position='bottom') +
+  ggtitle("AUC - pesi")
+
+dfm %>% 
+  filter(model %in% c('pesi', 'pesi_refitted')) %>%
+  ggplot(aes(m=prediction, d=DODin30, col=model)) + geom_roc(labels=F) +
+  theme_minimal() + theme(legend.position='bottom') +
+  ggtitle("AUC - pesi (refitted)")
+
+dfm %>% 
+  filter(model %in% c('pesi', 'pesi_refitted')) %>%
+  ggplot(aes(m=prediction, d=DODin30, col=model)) + geom_roc(labels=F) +
+  theme_minimal() + theme(legend.position='bottom') +
+  ggtitle("AUC - pesi (refitted)")
+  
+dfm %>%
+  ggplot(aes(m=prediction, d=DODin30, col=model)) + geom_roc(labels=F) +
+  theme_minimal() + theme(legend.position='bottom')
+  
+```
+
+```{r}
+library(rms)
+fit2 <- lrm(DODin30~age+cancer+lung_disease+(HeartRate_Mean >= 110)+(SysBP_Mean<100)+(SpO2_Mean), data = df, x=T, y=T)
+cal2 <- calibrate(fit2)
+plot(cal2)
+fit3 <- lrm(DODin30~age+cancer+lung_disease+(HeartRate_Mean >= 110)+(SysBP_Mean<100)+(SpO2_Mean) + Afib, data = df, x=T, y=T)
+cal3 <- calibrate(fit3)
+plot(cal3)
+```
+
+

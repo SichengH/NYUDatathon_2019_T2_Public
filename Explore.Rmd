@@ -1,0 +1,258 @@
+---
+title: "Explore"
+author: "Team2"
+date: "5/10/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(runner)
+library(glmnet)
+icu_stay<-read.csv("ICU_Stays.csv")
+admission<-read.csv("Admissions (Center Table).csv")
+hr<-read.csv("HR_Rhythms.csv")
+ecg<-read.csv("ECG Notes.csv")
+ct<-read.csv("CT Notes.csv")
+pressors<-read.csv("Pressors.csv")
+ct.des.level<-unique(ct$DESCRIPTION)
+ct.des.level<-ct.des.level[-5]
+ct<-ct%>%filter(DESCRIPTION %in% ct.des.level)
+vitals<-read.csv("ICU First Day Vitals.csv")
+eli.score<-read.csv("Elixhauser Scores.csv")
+comobs<-read.csv("comobs.csv")
+vent<-read.csv("Ventilation.csv")
+```
+
+# Goal Create a table to fit model
+
+Based on the ICU_stay table, each row is one ICU stay
+
+# Part One: Create Y
+
+## Merge CT into ICU_Stay
+
+```{r}
+unique(table(icu_stay$ICUSTAY_ID))
+ct.temp<-ct%>%select(SUBJECT_ID,HADM_ID,CHARTTIME)
+icu.ct<-left_join(icu_stay,ct.temp)
+icu.ct<-icu.ct%>%distinct()#Remove duplicated rows
+length(unique(icu.ct$SUBJECT_ID))#number of patient
+length(unique(icu.ct$ICUSTAY_ID))#number of stay
+table(table(icu.ct$ICUSTAY_ID))#Number of CT per ICU stay
+#Find NA's
+sum(is.na(icu.ct$CHARTTIME))#17 ICU stay does not have CT
+sum(is.na(icu.ct$LOS))
+sum(is.na(icu.ct$INTIME))
+sum(is.na(icu.ct$OUTTIME))
+icu.ct<-icu.ct[!is.na(icu.ct$CHARTTIME),]#remove NA in CT charttime
+icu.ct<-icu.ct[!is.na(icu.ct$LOS),]#remove rows with NA in LOS
+#recalculate LOS(since there are two NAs)
+table(table(icu.ct$ICUSTAY_ID))#Number of CT per ICU stay
+```
+## Filter the CT within 12 hours of ICU admission
+
+### Q how to filter CT scan time!!!!!
+```{r}
+icu.ct$CHARTTIME.l<-as.POSIXlt(icu.ct$CHARTTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct$INTIME.l<-as.POSIXlt(icu.ct$INTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct$OUTTIME.l<-as.POSIXlt(icu.ct$OUTTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct$CTafter<-as.numeric(icu.ct$CHARTTIME.l-icu.ct$INTIME.l)
+icu.ct$LOSmin<-as.numeric(icu.ct$OUTTIME.l-icu.ct$INTIME.l)
+hist(icu.ct$CTafter)
+icu.ct<-icu.ct[,-c(11,12,13)]
+icu.ct.temp<-icu.ct%>%select(ICUSTAY_ID,HADM_ID,CTafter)%>%filter(CTafter < 1440)%>%filter(CTafter>-1440)#key from icu.ct
+icu.ct<-left_join(icu.ct.temp,icu.ct)
+hist(icu.ct$CTafter)
+```
+
+## Merge Admission information(Creat 1. DOD within 30 days outcome;2. LOS+death in ICU 3. LOS_hosp+death )
+```{r}
+#key = HADM_ID
+length(unique(admission$HADM_ID))
+length(unique(admission$SUBJECT_ID))
+length(unique(icu.ct$HADM_ID))
+length(unique(icu.ct$SUBJECT_ID))
+
+icu.ct.ad<-left_join(icu.ct,admission)
+table(table(icu.ct.ad$ICUSTAY_ID))#11 went to ICU twice, 1 three times
+
+#1. DOD with in 30 days of ICU admission
+icu.ct.ad$CHARTTIME.l<-as.POSIXlt(icu.ct.ad$CHARTTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct.ad$INTIME.l<-as.POSIXlt(icu.ct.ad$INTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct.ad$OUTTIME.l<-as.POSIXlt(icu.ct.ad$OUTTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct.ad$DOD.l<-as.POSIXlt(icu.ct.ad$DOD,format ='%Y-%m-%dT%H:%M')
+icu.ct.ad$DODin30<-as.numeric(icu.ct.ad$DOD.l-icu.ct.ad$CHARTTIME.l)
+
+icu.ct.ad$DODin30<-icu.ct.ad$DODin30<43200
+icu.ct.ad$DODin30[is.na(icu.ct.ad$DODin30)]=F
+
+#2. LOS+death: 
+icu.ct.ad$DEATHTIME.l<-as.POSIXlt(icu.ct.ad$DEATHTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct.ad$death.icu<-as.numeric(icu.ct.ad$DEATHTIME.l-icu.ct.ad$OUTTIME.l)
+icu.ct.ad$death.icu<-icu.ct.ad$death.icu>3600
+icu.ct.ad$death.icu[is.na(icu.ct.ad$death.icu)]=F
+
+#3. LOS_HOSP+death: 
+#TODO ICU admission to discharge
+icu.ct.ad$DISCHTIME.l<-as.POSIXlt(icu.ct.ad$DISCHTIME,format ='%Y-%m-%dT%H:%M')
+icu.ct.ad$ICU_Discharge<-as.numeric(icu.ct.ad$DISCHTIME.l-icu.ct.ad$INTIME.l)
+```
+
+
+## Merge Sinus, Afib
+```{r}
+# select columns of interest data
+adm2<- admission %>% select(SUBJECT_ID, HADM_ID, ADMITTIME)  
+ct2<- ct %>% select(SUBJECT_ID, HADM_ID, CHARTTIME)
+icu2<- icu_stay %>% select(SUBJECT_ID, HADM_ID, INTIME)
+
+# merge columns of interest into 1 dataframe
+df<-merge(x=ct2,y=adm2,by=c("HADM_ID", "SUBJECT_ID"))
+df<-merge(x=df,y=icu2,by=c("HADM_ID", "SUBJECT_ID"))
+
+#convert to datetime
+# ADMITTIME= time of admission into ED
+# CHARTTIME= time of CT scan
+# INTIME= time of ICU admission
+df$ADMITTIME<-as.POSIXct(df$ADMITTIME,format = "%Y-%m-%dT%H:%M")
+df$CHARTTIME<-as.POSIXct(df$CHARTTIME,format = "%Y-%m-%dT%H:%M")
+df$INTIME<-as.POSIXct(df$INTIME,format = "%Y-%m-%dT%H:%M")
+
+# compute difference in time between CT scan and ICU admission
+df$time_diff_icu= df$CHARTTIME-df$INTIME
+
+# create flag if CT scan taken between admission to ED and less than or equal to 720 mins (12h) of ICU admission
+df$ct_criteria_flag= ifelse(df$time_diff_icu<=720,1,0)
+
+ct_key<-df
+# PART 2
+# Which patients entered with sinus rythm and then developed afib/aflut
+
+# import hr rhythm
+
+# select rhytms of interest
+hr<-hr %>% filter(VALUE %in% c("Normal Sinus",
+                           "SR (Sinus Rhythm)",
+                           "Atrial Fib",
+                           "AF (Atrial Fibrillation)",
+                           "Atrial Flutter",
+                           "A Flut (Atrial Flutter)"))
+
+
+# create a count/streak for icustay_id, flag for entering with sinud, flag for developing afib/aflut after sinus
+hr<-hr %>% group_by(HADM_ID, ICUSTAY_ID)  %>% arrange(CHARTTIME) %>% 
+  mutate(runs=streak_run(ICUSTAY_ID, k=1000),
+         sinus_adm= ifelse(VALUE %in% c("Normal Sinus","SR (Sinus Rhythm)")&runs %in% 1, 1,0),
+         af_after_adm= ifelse(VALUE %in% c("Atrial Fib", "AF (Atrial Fibrillation)","Atrial Flutter","A Flut (Atrial Flutter)") & runs != 1, 1,0),
+         combo= ifelse(sinus_adm==1,-1,0),
+         combo= ifelse(af_after_adm==1,1,combo))
+
+# create a flag for patients that developed sinus then afib 
+key.hr<- hr %>% filter(combo!=0) %>% group_by(ICUSTAY_ID) %>% mutate(sums= (sum((runs)))) %>% filter(sums!=1)  %>% select((ICUSTAY_ID))
+key.hr<- unique(key.hr)  #72 patients went from sinus->afib
+key.hr$afib_criteria<-1 
+
+# merge flag for patients that start with sinus and then develop afib & flag other patients as 0
+hr<-left_join(hr, key.hr,by = "ICUSTAY_ID")
+hr$afib_criteria[is.na(hr$afib_criteria)] <- 0
+hr$combo<-NULL
+
+#merge
+Afib<-hr%>%filter(afib_criteria ==1)
+Afib.id<-unique(Afib$ICUSTAY_ID)
+icu.ct.ad$Afib<-icu.ct.ad$ICUSTAY_ID%in%Afib.id
+```
+
+
+
+
+
+
+```{r}
+#select the fitst ICUs
+patient<-data.frame(SUBJECT_ID = unique(icu.ct.ad$SUBJECT_ID))
+first.icu<-left_join(patient,icu.ct.ad)
+
+icu<-data.frame(ICUSTAY_ID = unique(icu.ct.ad$ICUSTAY_ID))
+first.ct<-left_join(icu,icu.ct.ad)
+```
+# Part Two Create X
+
+```{r}
+pressors.id<-unique(pressors$ICUSTAY_ID)
+icu.ct.ad$pressors<-icu.ct.ad$ICUSTAY_ID%in%pressors.id
+#TODO detail about the pressors
+```
+
+
+```{r}
+icu.ct.ad$DOB.l<-as.POSIXct(icu.ct.ad$DOB,format = "%Y-%m-%dT%H:%M")
+icu.ct.ad$age<-as.numeric(icu.ct.ad$INTIME.l-icu.ct.ad$DOB.l)/365
+icu.ct.ad$age[icu.ct.ad$age>90]=90
+```
+
+# Vitals
+```{r}
+vitals.temp<-vitals%>%transmute(SUBJECT_ID = subject_id,HADM_ID = hadm_id, ICUSTAY_ID = icustay_id, HeartRate_Min,HeartRate_Max,HeartRate_Mean,SysBP_Min,SysBP_Max,SysBP_Mean,TempC_Min,TempC_Max,TempC_Mean,SpO2_Min,SpO2_Max,SpO2_Mean)
+```
+
+# Merger comobos, eli.socre, and vent
+```{r}
+time.rows<-c(30,31,32,33,35,37,41)
+data1<-left_join(icu.ct.ad[,-time.rows],vitals.temp)
+data2<-left_join(data1,comobs)
+eli.score$HADM_ID<-eli.score$hadm_id
+eli.score<-eli.score[,-1]
+data3<-left_join(data2,eli.score)
+data3<-left_join(data3,vent)
+data3$duration_hours[is.na(data3$duration_hours)]=0
+```
+
+
+```{r}
+patient<-data.frame(SUBJECT_ID = unique(data3$SUBJECT_ID))
+
+#df<-merge(x=df1,y=df2,by="CustomerId",all.x=TRUE)
+first.icu<-merge(patient,data3)
+
+afib.patient<-data3%>%filter(Afib == T)
+sinus.patient<-data3%>%filter(Afib == F)
+length(unique(afib.patient$SUBJECT_ID))
+length(unique(sinus.patient$SUBJECT_ID))
+
+icu<-data.frame(ICUSTAY_ID = unique(data3$ICUSTAY_ID))
+first.ct<-merge(icu,data3,all.x=TRUE)
+write.csv(data3,file = "output_data.csv")
+write.csv(first.icu,file = "outpout_data_firsticu.csv")
+write.csv(first.ct,file = "output_data_firstct")
+```
+
+
+
+# Model
+
+Find the predictors for Afib
+```{r}
+x.var<-data3%>%select(DODin30,GENDER,pressors,age,HeartRate_Min,HeartRate_Max,HeartRate_Mean,SysBP_Max,
+                                SysBP_Mean,SysBP_Min,TempC_Max,TempC_Min,TempC_Mean,SpO2_Min,SpO2_Max,SpO2_Mean,heart_failure,
+                                lung_disease,cancer,elixhauser_vanwalraven,elixhauser_SID29,elixhauser_SID30)
+x.var<-na.omit(x.var1)
+y = x.var$DODin30
+x<-model.matrix(DODin30~., x.var)[,-1]
+cv.lasso1 <- cv.glmnet(x, y, alpha = 1, family = "binomial")
+# Fit the final model on the training data
+model <- glmnet(x, y, alpha = 1, family = "binomial",
+                lambda = cv.lasso$lambda.min)
+
+coef(model)
+coef(cv.lasso, cv.lasso$lambda.min)
+
+x.test <- model.matrix(Afib ~., x.var)[,-1]
+probabilities <- model1 %>% predict(newx = x.test)
+predicted.classes <- ifelse(probabilities > 0.5, T, F)
+# Model accuracy rate
+observed.classes <- x.var$Afib
+mean(predicted.classes == observed.classes)
